@@ -18,7 +18,7 @@ import {
 
 import { isPlatformBrowser } from '@angular/common';
 
-import { Observable, Subject, combineLatest, merge, from, fromEvent, BehaviorSubject, asyncScheduler } from 'rxjs';
+import { Observable, Subject, combineLatest, merge, from, fromEvent, BehaviorSubject, asyncScheduler, of } from 'rxjs';
 
 import {
   switchMap,
@@ -34,13 +34,21 @@ import {
   observeOn,
   startWith,
   concatMapTo,
-  first
+  first,
+  mergeMap,
+  last,
+  endWith,
+  scan,
+  flatMap,
+  delay,
+  debounceTime,
+  throttleTime
 } from 'rxjs/operators';
 
 import { SelectItemDirective } from './select-item.directive';
 import { ShortcutService } from './shortcut.service';
 
-import { createSelectBox, whenSelectBoxVisible, distinctKeyEvents } from './operators';
+import { createSelectBox, whenSelectBoxVisible, distinctKeyEvents, DragState } from './operators';
 
 import {
   Action,
@@ -64,6 +72,22 @@ import {
   getMousePosition,
   hasMinimumSize
 } from './utils';
+
+interface SelectionMode {
+  addToSelection: boolean;
+  disableSelection: boolean;
+  extendedSelectionShortcut: boolean;
+  removeFromSelection: boolean;
+  toggleSingleItem: boolean;
+}
+
+const createEmptySelectionMode = (): SelectionMode => ({
+  addToSelection: false,
+  disableSelection: false,
+  extendedSelectionShortcut: false,
+  removeFromSelection: false,
+  toggleSingleItem: false
+});
 
 @Component({
   selector: 'dts-select-container',
@@ -133,10 +157,7 @@ export class SelectContainerComponent implements AfterViewInit, OnDestroy {
   @Output()
   selectionEnded = new EventEmitter<Array<any>>();
 
-  private _tmpItems = new Map<SelectItemDirective, Action>();
-
-  private _selectedItems$ = new BehaviorSubject<Array<any>>([]);
-  private updateItems$ = new Subject<UpdateAction>();
+  private updateItems$ = new Subject<{ items: { [key: number]: SelectItemDirective[] }; event: DragState }>();
   private destroy$ = new Subject<void>();
 
   constructor(
@@ -151,227 +172,193 @@ export class SelectContainerComponent implements AfterViewInit, OnDestroy {
     if (isPlatformBrowser(this.platformId)) {
       this.host = this.hostElementRef.nativeElement;
 
-      this._initSelectedItemsChange();
-
       this._calculateBoundingClientRect();
       this._observeBoundingRectChanges();
-      this._observeSelectableItems();
 
-      // distinctKeyEvents is used to prevent multiple key events to be fired repeatedly
-      // on Windows when a key is being pressed
+      const move$ = fromEvent<MouseEvent>(document, 'mousemove').pipe(share());
+      const down$ = fromEvent<MouseEvent>(this.host, 'mousedown').pipe(
+        filter(event => event.button === 0),
+        tap(() => this.renderer.addClass(document.body, NO_SELECT_CLASS)),
+        share()
+      );
 
-      const keydown$ = fromEvent<KeyboardEvent>(window, 'keydown').pipe(
+      const up$ = fromEvent<MouseEvent>(document, 'mouseup').pipe(
+        tap(() => this.renderer.removeClass(document.body, NO_SELECT_CLASS)),
+        share()
+      );
+      const keydown$ = fromEvent<KeyboardEvent>(document, 'keydown').pipe(share());
+      const keyup$ = fromEvent<KeyboardEvent>(document, 'keyup').pipe(share());
+
+      const keys$ = merge(keydown$, keyup$).pipe(
         distinctKeyEvents(),
-        share()
-      );
-
-      const keyup$ = fromEvent<KeyboardEvent>(window, 'keyup').pipe(
-        distinctKeyEvents(),
-        share()
-      );
-
-      const mouseup$ = fromEvent<MouseEvent>(window, 'mouseup').pipe(
-        filter(() => !this.disabled),
-        tap(() => this._onMouseUp()),
-        share()
-      );
-
-      const mousemove$ = fromEvent<MouseEvent>(window, 'mousemove').pipe(
-        filter(() => !this.disabled),
-        share()
-      );
-
-      const mousedown$ = fromEvent<MouseEvent>(this.host, 'mousedown').pipe(
-        filter(event => event.button === 0), // only emit left mouse
-        filter(() => !this.disabled),
-        tap(event => this._onMouseDown(event)),
-        share()
-      );
-
-      const dragging$ = mousedown$.pipe(
-        filter(event => !this.shortcuts.disableSelection(event)),
-        filter(() => !this.selectMode),
-        filter(() => !this.disableDrag),
-        switchMap(() => mousemove$.pipe(takeUntil(mouseup$))),
-        share()
-      );
-
-      const currentMousePosition$: Observable<MousePosition> = mousedown$.pipe(
-        map((event: MouseEvent) => getRelativeMousePosition(event, this.host))
-      );
-
-      const show$ = dragging$.pipe(mapTo(1));
-      const hide$ = mouseup$.pipe(mapTo(0));
-      const opacity$ = merge(show$, hide$).pipe(distinctUntilChanged());
-
-      const selectBox$ = combineLatest(dragging$, opacity$, currentMousePosition$).pipe(
-        createSelectBox(this.host),
-        share()
-      );
-
-      this.selectBoxClasses$ = merge(dragging$, mouseup$, keydown$, keyup$).pipe(
-        auditTime(AUDIT_TIME),
-        withLatestFrom(selectBox$),
-        map(([event, selectBox]) => {
-          return {
-            'dts-adding': hasMinimumSize(selectBox, 0, 0) && !this.shortcuts.removeFromSelection(event),
-            'dts-removing': this.shortcuts.removeFromSelection(event)
-          };
-        }),
-        distinctUntilChanged((a, b) => JSON.stringify(a) === JSON.stringify(b))
-      );
-
-      const selectOnMouseUp$ = mouseup$.pipe(
-        filter(() => !this.selectOnDrag),
-        filter(() => !this.selectMode),
-        filter(event => this._cursorWithinHost(event)),
-        filter(
+        map(
           event =>
-            (!this.shortcuts.disableSelection(event) && !this.shortcuts.toggleSingleItem(event)) ||
-            this.shortcuts.removeFromSelection(event)
+            event.type === 'keyup'
+              ? createEmptySelectionMode()
+              : <SelectionMode>{
+                  addToSelection: this.shortcuts.addToSelection(event),
+                  disableSelection: this.shortcuts.disableSelection(event),
+                  extendedSelectionShortcut: this.shortcuts.extendedSelectionShortcut(event),
+                  removeFromSelection: this.shortcuts.removeFromSelection(event),
+                  toggleSingleItem: this.shortcuts.toggleSingleItem(event)
+                }
+        ),
+        startWith(createEmptySelectionMode()),
+        takeUntil(this.destroy$),
+        share()
+      );
+
+      const drag: Observable<DragState> = down$.pipe(
+        filter(() => !this.disabled),
+        auditTime(AUDIT_TIME),
+        map(event => getRelativeMousePosition(event, this.host)),
+        flatMap(down =>
+          move$.pipe(
+            map(event => getRelativeMousePosition(event, this.host)),
+            map(move => ({ state: 'DRAGGING', down, move })),
+            takeUntil(up$),
+            startWith({ state: 'DRAGGING_START', down }),
+            endWith({ state: 'DRAGGING_END' })
+          )
+        ),
+        takeUntil(this.destroy$),
+        share()
+      );
+
+      this.updateItems$
+        .pipe(
+          withLatestFrom(keys$),
+          scan<
+            [{ items: { [key: number]: SelectItemDirective[] }; event: DragState }, SelectionMode],
+            { selectedItems: SelectItemDirective[] }
+          >(
+            (state, [{ event, items: newItems }, keys]) => {
+              // if we emit an action, ignore the options
+              if (event.state !== 'FORCED') {
+                if (
+                  this.selectWithShortcut &&
+                  !keys.extendedSelectionShortcut &&
+                  !keys.toggleSingleItem &&
+                  !keys.addToSelection
+                ) {
+                  return state;
+                }
+
+                if (this.disabled) {
+                  return state;
+                }
+
+                // take options into account
+                if (!this.selectOnDrag && event.state === 'DRAGGING') {
+                  return state;
+                }
+
+                if (this.selectMode && event.state !== 'DRAGGING_END') {
+                  return state;
+                } else if (this.selectMode && event.state === 'DRAGGING_END' && newItems[1].length > 1) {
+                  // THIS IS A BREAKING CHANGE
+                  // Problem is that at this point it has more than 1 selected item - and we don't know the first item selected
+                  // In the DRAGGING_START event, the selected items aren't available because the dragbox isn't created
+                  // Should we create a second dragbox, only for use in the calucations
+                  // And the current dragbox only for UI purposes?
+                  return state;
+                }
+              }
+
+              const newState = { selectedItems: [...state.selectedItems] };
+
+              // calucate selected items
+              if (keys.toggleSingleItem || this.selectMode) {
+                newItems[1].forEach(item => {
+                  if (state.selectedItems.includes(item)) {
+                    newState.selectedItems = newState.selectedItems.filter(remove => item !== remove);
+                  } else {
+                    newState.selectedItems.push(item);
+                  }
+                });
+              } else if (keys.addToSelection) {
+                newState.selectedItems.push(...newItems[1].filter(item => !state.selectedItems.includes(item)));
+              } else {
+                newState.selectedItems = newItems[1];
+              }
+
+              // actually select and deselect items
+              state.selectedItems.filter(item => !newState.selectedItems.includes(item)).forEach(item => {
+                item._deselect();
+              });
+
+              newState.selectedItems.filter(item => !state.selectedItems.includes(item)).forEach(item => {
+                item._select();
+              });
+
+              return newState;
+            },
+            {
+              selectedItems: []
+            }
+          ),
+          takeUntil(this.destroy$)
         )
-      );
+        .subscribe(items => {
+          const values = items.selectedItems.map(x => x.value);
 
-      const selectOnDrag$ = selectBox$.pipe(
-        auditTime(AUDIT_TIME),
-        withLatestFrom(mousemove$, (selectBox, event: MouseEvent) => ({
-          selectBox,
-          event
-        })),
-        filter(() => this.selectOnDrag),
-        filter(({ selectBox }) => hasMinimumSize(selectBox)),
-        map(({ event }) => event)
-      );
+          this.selectedItems.filter(item => !values.includes(item)).forEach(item => {
+            const index = this.selectedItems.indexOf(item);
+            this.selectedItems.splice(index, 1);
+          });
 
-      const selectOnKeyboardEvent$ = merge(keydown$, keyup$).pipe(
-        auditTime(AUDIT_TIME),
-        whenSelectBoxVisible(selectBox$),
-        tap(event => {
-          if (this._isExtendedSelection(event)) {
-            this._tmpItems.clear();
-          } else {
-            this._flushItems();
-          }
-        })
-      );
+          values.filter(item => !this.selectedItems.includes(item)).forEach(item => {
+            this.selectedItems.push(item);
+          });
+        });
 
-      merge(selectOnMouseUp$, selectOnDrag$, selectOnKeyboardEvent$)
-        .pipe(takeUntil(this.destroy$))
-        .subscribe(event => this._selectItems(event));
-
-      this.selectBoxStyles$ = selectBox$.pipe(
-        map(selectBox => ({
-          top: `${selectBox.top}px`,
-          left: `${selectBox.left}px`,
-          width: `${selectBox.width}px`,
-          height: `${selectBox.height}px`,
-          opacity: selectBox.opacity
-        }))
-      );
-
-      this._initSelectionOutputs(mousedown$, mouseup$);
+      this.createDragBox(drag);
+      this.itemSelectionHandler(drag);
     }
   }
 
-  selectAll() {
-    this.$selectableItems.forEach(item => {
-      this._selectItem(item);
-    });
+  private createDragBox(drag: Observable<DragState>) {
+    this.selectBoxStyles$ = drag.pipe(
+      createSelectBox(),
+      map(selectBox => ({
+        top: `${selectBox.top}px`,
+        left: `${selectBox.left}px`,
+        width: `${selectBox.width}px`,
+        height: `${selectBox.height}px`,
+        opacity: this.selectMode ? 0 : selectBox.opacity // still create the box because it's needed in itemSelectionHandler
+      }))
+    );
   }
 
-  toggleItems<T>(predicate: PredicateFn<T>) {
-    this._filterSelectableItems(predicate).subscribe((item: SelectItemDirective) => this._toggleItem(item));
-  }
-
-  selectItems<T>(predicate: PredicateFn<T>) {
-    this._filterSelectableItems(predicate).subscribe((item: SelectItemDirective) => this._selectItem(item));
-  }
-
-  deselectItems<T>(predicate: PredicateFn<T>) {
-    this._filterSelectableItems(predicate).subscribe((item: SelectItemDirective) => this._deselectItem(item));
-  }
-
-  clearSelection() {
-    this.$selectableItems.forEach(item => {
-      this._deselectItem(item);
-    });
-  }
-
-  update() {
-    this._calculateBoundingClientRect();
-    this.$selectableItems.forEach(item => item.calculateBoundingClientRect());
-  }
-
-  ngOnDestroy() {
-    this.destroy$.next();
-    this.destroy$.complete();
-  }
-
-  private _filterSelectableItems<T>(predicate: PredicateFn<T>) {
-    // Wrap select items in an observable for better efficiency as
-    // no intermediate arrays are created and we only need to process
-    // every item once.
-    return from(this.$selectableItems.toArray()).pipe(filter(item => predicate(item.value)));
-  }
-
-  private _initSelectedItemsChange() {
-    this._selectedItems$
+  private itemSelectionHandler(drag: Observable<DragState>) {
+    drag
       .pipe(
-        auditTime(AUDIT_TIME),
-        takeUntil(this.destroy$)
-      )
-      .subscribe({
-        next: selectedItems => {
-          this.selectedItemsChange.emit(selectedItems);
-          this.select.emit(selectedItems);
-        },
-        complete: () => {
-          this.selectedItemsChange.emit([]);
-        }
-      });
-  }
-
-  private _observeSelectableItems() {
-    // Listen for updates and either select or deselect an item
-    this.updateItems$
-      .pipe(
-        withLatestFrom(this._selectedItems$),
-        takeUntil(this.destroy$)
-      )
-      .subscribe(([update, selectedItems]: [UpdateAction, any[]]) => {
-        const item = update.item;
-
-        switch (update.type) {
-          case UpdateActions.Add:
-            if (this._addItem(item, selectedItems)) {
-              item._select();
+        map(event => {
+          const selectionBox = calculateBoundingClientRect(this.$selectBox.nativeElement);
+          const items = this.$selectableItems.reduce<{
+            [key: number]: SelectItemDirective[];
+          }>(
+            (dict, item) => {
+              const inSelection = boxIntersects(selectionBox, item.getBoundingClientRect());
+              dict[inSelection ? 1 : 0] = dict[inSelection ? 1 : 0].concat(item);
+              return dict;
+            },
+            {
+              0: [],
+              1: []
             }
-            break;
-          case UpdateActions.Remove:
-            if (this._removeItem(item, selectedItems)) {
-              item._deselect();
-            }
-            break;
-        }
-      });
-
-    // Update the container as well as all selectable items if the list has changed
-    this.$selectableItems.changes
-      .pipe(
-        withLatestFrom(this._selectedItems$),
-        observeOn(asyncScheduler),
+          );
+          return { items, event };
+        }),
         takeUntil(this.destroy$)
       )
-      .subscribe(([items, selectedItems]: [QueryList<SelectItemDirective>, any[]]) => {
-        const newList = items.toArray();
-        const removedItems = selectedItems.filter(item => !newList.includes(item.value));
-
-        if (removedItems.length) {
-          removedItems.forEach(item => this._removeItem(item, selectedItems));
-        }
-
-        this.update();
+      .subscribe(items => {
+        this.updateItems$.next(items);
       });
+  }
+
+  private _calculateBoundingClientRect() {
+    this.host.boundingClientRect = calculateBoundingClientRect(this.host);
   }
 
   private _observeBoundingRectChanges() {
@@ -392,201 +379,62 @@ export class SelectContainerComponent implements AfterViewInit, OnDestroy {
     });
   }
 
-  private _initSelectionOutputs(mousedown$: Observable<MouseEvent>, mouseup$: Observable<MouseEvent>) {
-    mousedown$
-      .pipe(
-        filter(event => this._cursorWithinHost(event)),
-        tap(() => this.selectionStarted.emit()),
-        concatMapTo(mouseup$.pipe(first())),
-        withLatestFrom(this._selectedItems$),
-        map(([, items]) => items),
-        takeUntil(this.destroy$)
-      )
-      .subscribe(items => {
-        this.selectionEnded.emit(items);
-      });
+  update() {
+    this._calculateBoundingClientRect();
+    this.$selectableItems.forEach(item => item.calculateBoundingClientRect());
   }
 
-  private _calculateBoundingClientRect() {
-    this.host.boundingClientRect = calculateBoundingClientRect(this.host);
+  ngOnDestroy() {
+    this.destroy$.next();
+    this.destroy$.complete();
   }
 
-  private _cursorWithinHost(event: MouseEvent) {
-    return cursorWithinElement(event, this.host);
-  }
-
-  private _onMouseUp() {
-    this._flushItems();
-    this.renderer.removeClass(document.body, NO_SELECT_CLASS);
-  }
-
-  private _onMouseDown(event: MouseEvent) {
-    if (this.shortcuts.disableSelection(event) || this.disabled) {
-      return;
-    }
-
-    clearSelection(window);
-
-    if (!this.disableDrag) {
-      this.renderer.addClass(document.body, NO_SELECT_CLASS);
-    }
-
-    const mousePoint = getMousePosition(event);
-
-    this.$selectableItems.forEach((item, index) => {
-      const itemRect = item.getBoundingClientRect();
-      const withinBoundingBox = inBoundingBox(mousePoint, itemRect);
-
-      if (this.shortcuts.extendedSelectionShortcut(event)) {
-        return;
-      }
-
-      const shouldAdd =
-        (withinBoundingBox &&
-          !this.shortcuts.toggleSingleItem(event) &&
-          !this.selectMode &&
-          !this.selectWithShortcut) ||
-        (withinBoundingBox && this.shortcuts.toggleSingleItem(event) && !item.selected) ||
-        (!withinBoundingBox && this.shortcuts.toggleSingleItem(event) && item.selected) ||
-        (withinBoundingBox && !item.selected && this.selectMode) ||
-        (!withinBoundingBox && item.selected && this.selectMode);
-
-      const shouldRemove =
-        (!withinBoundingBox &&
-          !this.shortcuts.toggleSingleItem(event) &&
-          !this.selectMode &&
-          !this.selectWithShortcut) ||
-        (!withinBoundingBox && this.shortcuts.toggleSingleItem(event) && !item.selected) ||
-        (withinBoundingBox && this.shortcuts.toggleSingleItem(event) && item.selected) ||
-        (!withinBoundingBox && !item.selected && this.selectMode) ||
-        (withinBoundingBox && item.selected && this.selectMode);
-
-      if (shouldAdd) {
-        this._selectItem(item);
-      } else if (shouldRemove) {
-        this._deselectItem(item);
-      }
+  selectAll() {
+    this.updateItems$.next({
+      items: { [1]: this.$selectableItems.toArray(), 0: [] },
+      event: { state: 'FORCED' }
     });
   }
 
-  private _selectItems(event: Event) {
-    const selectionBox = calculateBoundingClientRect(this.$selectBox.nativeElement);
-
-    this.$selectableItems.forEach(item => {
-      if (this._isExtendedSelection(event)) {
-        this._extendedSelectionMode(selectionBox, item, event);
-      } else {
-        this._normalSelectionMode(selectionBox, item, event);
-      }
+  clearSelection() {
+    this.updateItems$.next({
+      items: { [0]: this.$selectableItems.toArray(), 1: [] },
+      event: { state: 'FORCED' }
     });
   }
 
-  private _isExtendedSelection(event: Event) {
-    return this.shortcuts.extendedSelectionShortcut(event) && this.selectOnDrag;
-  }
-
-  private _normalSelectionMode(selectBox, item: SelectItemDirective, event: Event) {
-    const inSelection = boxIntersects(selectBox, item.getBoundingClientRect());
-
-    const shouldAdd = inSelection && !item.selected && !this.shortcuts.removeFromSelection(event);
-
-    const shouldRemove =
-      (!inSelection && item.selected && !this.shortcuts.addToSelection(event)) ||
-      (inSelection && item.selected && this.shortcuts.removeFromSelection(event));
-
-    if (shouldAdd) {
-      this._selectItem(item);
-    } else if (shouldRemove) {
-      this._deselectItem(item);
-    }
-  }
-
-  private _extendedSelectionMode(selectBox, item: SelectItemDirective, event: Event) {
-    const inSelection = boxIntersects(selectBox, item.getBoundingClientRect());
-
-    const shoudlAdd =
-      (inSelection && !item.selected && !this.shortcuts.removeFromSelection(event) && !this._tmpItems.has(item)) ||
-      (inSelection && item.selected && this.shortcuts.removeFromSelection(event) && !this._tmpItems.has(item));
-
-    const shouldRemove =
-      (!inSelection && item.selected && this.shortcuts.addToSelection(event) && this._tmpItems.has(item)) ||
-      (!inSelection && !item.selected && this.shortcuts.removeFromSelection(event) && this._tmpItems.has(item));
-
-    if (shoudlAdd) {
-      item.selected ? item._deselect() : item._select();
-
-      const action = this.shortcuts.removeFromSelection(event)
-        ? Action.Delete
-        : this.shortcuts.addToSelection(event)
-        ? Action.Add
-        : Action.None;
-
-      this._tmpItems.set(item, action);
-    } else if (shouldRemove) {
-      this.shortcuts.removeFromSelection(event) ? item._select() : item._deselect();
-      this._tmpItems.delete(item);
-    }
-  }
-
-  private _flushItems() {
-    this._tmpItems.forEach((action, item) => {
-      if (action === Action.Add) {
-        this._selectItem(item);
+  toggleItems<T>(predicate: PredicateFn<T>) {
+    const items = this.$selectableItems.reduce<{
+      [key: number]: SelectItemDirective[];
+    }>(
+      (dict, item) => {
+        const isSelected = item.selected;
+        dict[isSelected ? 1 : 0] = dict[isSelected ? 1 : 0].concat(item);
+        return dict;
+      },
+      {
+        0: [],
+        1: []
       }
+    );
 
-      if (action === Action.Delete) {
-        this._deselectItem(item);
-      }
+    this.updateItems$.next({
+      items,
+      event: { state: 'FORCED' }
     });
-
-    this._tmpItems.clear();
   }
 
-  private _addItem(item: SelectItemDirective, selectedItems: Array<any>) {
-    let success = false;
-
-    if (!this._hasItem(item, selectedItems)) {
-      success = true;
-      selectedItems.push(item.value);
-      this._selectedItems$.next(selectedItems);
-      this.itemSelected.emit(item.value);
-    }
-
-    return success;
+  selectItems<T>(predicate: PredicateFn<T>) {
+    this.updateItems$.next({
+      items: { 1: this.$selectableItems.filter(item => predicate(item.value)), 0: [] },
+      event: { state: 'FORCED' }
+    });
   }
 
-  private _removeItem(item: SelectItemDirective, selectedItems: Array<any>) {
-    let success = false;
-    const value = item instanceof SelectItemDirective ? item.value : item;
-    const index = selectedItems.indexOf(value);
-
-    if (index > -1) {
-      success = true;
-      selectedItems.splice(index, 1);
-      this._selectedItems$.next(selectedItems);
-      this.itemDeselected.emit(item.value);
-    }
-
-    return success;
-  }
-
-  private _toggleItem(item: SelectItemDirective) {
-    if (item.selected) {
-      this._deselectItem(item);
-    } else {
-      this._selectItem(item);
-    }
-  }
-
-  private _selectItem(item: SelectItemDirective) {
-    this.updateItems$.next({ type: UpdateActions.Add, item });
-  }
-
-  private _deselectItem(item: SelectItemDirective) {
-    this.updateItems$.next({ type: UpdateActions.Remove, item });
-  }
-
-  private _hasItem(item: SelectItemDirective, selectedItems: Array<any>) {
-    return selectedItems.includes(item.value);
+  deselectItems<T>(predicate: PredicateFn<T>) {
+    this.updateItems$.next({
+      items: { 0: this.$selectableItems.filter(item => predicate(item.value)), 1: [] },
+      event: { state: 'FORCED' }
+    });
   }
 }
