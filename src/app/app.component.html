@@ -19,10 +19,14 @@
       <span>Desktop Demo</span> <a href="https://github.com/d3lm/ngx-drag-to-select/blob/master/src/app">SOURCE</a>
     </h3>
 
-    <mat-checkbox data-cy="selectOnDrag" [(ngModel)]="selectOnDrag">Select on Drag</mat-checkbox>
-    <mat-checkbox data-cy="disable" [(ngModel)]="disable">Disable</mat-checkbox>
-    <mat-checkbox data-cy="selectMode" [(ngModel)]="selectMode">Select Mode</mat-checkbox>
-    <mat-checkbox data-cy="selectWithShortcut" [(ngModel)]="selectWithShortcut">Select with Shortcut</mat-checkbox>
+    <label>Select mode</label>
+    <select [(ngModel)]="mode">
+      <option value="click">Select on click</option>
+      <option value="drag">Select on Drag</option>
+      <option value="select">Select Mode</option>
+      <option value="shortcut">Select with Shortcut</option>
+      <option value="disable">Disabled</option>
+    </select>
 
     <button data-cy="selectAll" mat-raised-button (click)="selectContainer.selectAll()">Select All</button>
     <button data-cy="clearSelection" mat-raised-button (click)="selectContainer.clearSelection()">
@@ -31,12 +35,10 @@
 
     <div class="drag-area">
       <dts-select-container
+        data-cy="select-container"
         #selectContainer="dts-select-container"
-        [selectMode]="selectMode"
         [(selectedItems)]="selectedDocuments"
-        [disabled]="disable"
-        [selectOnDrag]="selectOnDrag"
-        [selectWithShortcut]="selectWithShortcut"
+        [mode]="mode"
       >
         <mat-grid-list cols="4" rowHeight="200px" gutterSize="20px">
           <mat-grid-tile [dtsSelectItem]="document" *ngFor="let document of documents">

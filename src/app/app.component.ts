@@ -18,6 +18,7 @@ export class AppComponent implements OnInit {
   disable = false;
   isDesktop = false;
   selectWithShortcut = false;
+  mode = 'click';
 
   constructor(
     private titleService: Title,

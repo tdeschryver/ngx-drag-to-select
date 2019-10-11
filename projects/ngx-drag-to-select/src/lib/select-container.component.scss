@@ -1,4 +1,27 @@
 :host {
   display: block;
   position: relative;
+
+  --mouse-x1: 0;
+  --mouse-y1: 0;
+  --mouse-x2: 0;
+  --mouse-y2: 0;
+}
+
+.select-box {
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(0, 0, 0, 0.2);
+  border: 2px solid currentColor;
+  position: fixed;
+  left: calc(var(--mouse-x1) * 1px);
+  top: calc(var(--mouse-y1) * 1px);
+  width: calc((var(--mouse-x2) - var(--mouse-x1)) * 1px);
+  height: calc((var(--mouse-y2) - var(--mouse-y1)) * 1px);
+  transition: opacity 0.3s ease-in-out;
+  z-index: 2;
+  opacity: 0;
+}
+
+[data-state*='dragMode.dragging'] .select-box {
+  opacity: 1;
 }
